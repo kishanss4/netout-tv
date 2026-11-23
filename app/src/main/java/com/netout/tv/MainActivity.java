@@ -7,14 +7,20 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.net.Uri;
+import android.os.Message;
 import android.webkit.CookieManager;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 
 public class MainActivity extends Activity {
 
@@ -24,6 +30,7 @@ public class MainActivity extends Activity {
     private FrameLayout root;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
+    private String navScript = "";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -44,9 +51,12 @@ public class MainActivity extends Activity {
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
-        s.setJavaScriptCanOpenWindowsAutomatically(true);
+        s.setSupportMultipleWindows(true);            // so we can deny popups
+        s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+        navScript = readAsset("tv_nav.js");
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
@@ -61,18 +71,38 @@ public class MainActivity extends Activity {
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                Uri u = r.getUrl();
+                if (AdBlocker.isBlockedUrl(u.toString(), u.getHost())) {
+                    return AdBlocker.empty();
+                }
+                return null;
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
-                return false; // keep all navigation inside the app
+                Uri u = r.getUrl();
+                String scheme = u.getScheme() == null ? "" : u.getScheme();
+                if (!scheme.equals("http") && !scheme.equals("https")) return true; // intent://, market://
+                if (AdBlocker.isBlockedUrl(u.toString(), u.getHost())) return true;
+                // block automatic (no remote press) jumps to a different site = ad redirects
+                if (r.isForMainFrame() && !r.hasGesture() && v.getUrl() != null) {
+                    String cur = Uri.parse(v.getUrl()).getHost();
+                    if (cur != null && u.getHost() != null && !sameSite(cur, u.getHost())) return true;
+                }
+                return false;
             }
 
             @Override
             public void onPageStarted(WebView v, String url, Bitmap favicon) {
                 super.onPageStarted(v, url, favicon);
+                v.evaluateJavascript(navScript, null);
             }
 
             @Override
             public void onPageFinished(WebView v, String url) {
                 super.onPageFinished(v, url);
+                v.evaluateJavascript(navScript, null);
                 CookieManager.getInstance().flush();
                 v.requestFocus(View.FOCUS_DOWN);
             }
@@ -105,6 +135,16 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public boolean onCreateWindow(WebView v, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                return false; // deny all popups / new windows
+            }
+
+            @Override
+            public void onProgressChanged(WebView v, int progress) {
+                if (progress > 30) v.evaluateJavascript(navScript, null);
+            }
+
+            @Override
             public void onPermissionRequest(PermissionRequest request) {
                 request.grant(request.getResources()); // e.g. protected media (DRM) ID
             }
@@ -129,7 +169,49 @@ public class MainActivity extends Activity {
                 return true;
             }
         }
+        if (customView != null) {
+            switch (keyCode) {
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
+                    webView.evaluateJavascript("window.__tvSeek&&__tvSeek(10)", null);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                case KeyEvent.KEYCODE_MEDIA_REWIND:
+                    webView.evaluateJavascript("window.__tvSeek&&__tvSeek(-10)", null);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER:
+                case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                case KeyEvent.KEYCODE_MEDIA_PLAY:
+                case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                    webView.evaluateJavascript("window.__tvToggle&&__tvToggle()", null);
+                    return true;
+                default:
+                    break;
+            }
+        }
         return super.onKeyDown(keyCode, event);
+    }
+
+    private static boolean sameSite(String a, String b) {
+        return a.equals(b) || a.endsWith("." + b) || b.endsWith("." + a)
+                || root(a).equals(root(b));
+    }
+
+    private static String root(String h) {
+        String[] p = h.split("\\.");
+        return p.length < 2 ? h : p[p.length - 2] + "." + p[p.length - 1];
+    }
+
+    private String readAsset(String name) {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(getAssets().open(name), "UTF-8"))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private void enterImmersive() {
