@@ -180,6 +180,95 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------------------
+    // dispatchKeyEvent: intercept D-pad BEFORE the system consumes them
+    // for native focus navigation. This is critical on devices like
+    // Tata Play Binge where onKeyDown never reaches the WebView/JS.
+    // ---------------------------------------------------------------
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        int action = event.getAction();
+
+        // Back key: handle in onKeyDown as before
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            return super.dispatchKeyEvent(event);
+        }
+
+        // Fullscreen video: seek / play-pause handled natively
+        if (customView != null) {
+            if (action == KeyEvent.ACTION_DOWN) {
+                switch (keyCode) {
+                    case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
+                        webView.evaluateJavascript("window.__tvSeek&&__tvSeek(10)", null);
+                        return true;
+                    case KeyEvent.KEYCODE_DPAD_LEFT:
+                    case KeyEvent.KEYCODE_MEDIA_REWIND:
+                        webView.evaluateJavascript("window.__tvSeek&&__tvSeek(-10)", null);
+                        return true;
+                    case KeyEvent.KEYCODE_DPAD_CENTER:
+                    case KeyEvent.KEYCODE_ENTER:
+                    case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                    case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                    case KeyEvent.KEYCODE_MEDIA_PLAY:
+                    case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                        webView.evaluateJavascript("window.__tvToggle&&__tvToggle()", null);
+                        return true;
+                    case KeyEvent.KEYCODE_DPAD_UP:
+                    case KeyEvent.KEYCODE_DPAD_DOWN:
+                        return true; // swallow up/down in fullscreen
+                }
+            } else if (action == KeyEvent.ACTION_UP) {
+                // Consume ACTION_UP too so the system doesn't act on it
+                switch (keyCode) {
+                    case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    case KeyEvent.KEYCODE_DPAD_LEFT:
+                    case KeyEvent.KEYCODE_DPAD_UP:
+                    case KeyEvent.KEYCODE_DPAD_DOWN:
+                    case KeyEvent.KEYCODE_DPAD_CENTER:
+                    case KeyEvent.KEYCODE_ENTER:
+                    case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                    case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
+                    case KeyEvent.KEYCODE_MEDIA_REWIND:
+                    case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                    case KeyEvent.KEYCODE_MEDIA_PLAY:
+                    case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                        return true;
+                }
+            }
+            return super.dispatchKeyEvent(event);
+        }
+
+        // Normal browsing: inject D-pad keys into JavaScript so our
+        // spatial navigation works even when the system eats keydown.
+        boolean isDpad = false;
+        String jsKey = null;
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_UP:    jsKey = "ArrowUp";    isDpad = true; break;
+            case KeyEvent.KEYCODE_DPAD_DOWN:  jsKey = "ArrowDown";  isDpad = true; break;
+            case KeyEvent.KEYCODE_DPAD_LEFT:  jsKey = "ArrowLeft";  isDpad = true; break;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: jsKey = "ArrowRight"; isDpad = true; break;
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                jsKey = "Enter"; isDpad = true; break;
+        }
+
+        if (isDpad) {
+            if (action == KeyEvent.ACTION_DOWN) {
+                boolean isRepeat = event.getRepeatCount() > 0;
+                String js = "window.__tvKey&&__tvKey('" + jsKey + "'," + isRepeat + ")";
+                webView.evaluateJavascript(js, null);
+            }
+            // Consume both ACTION_DOWN and ACTION_UP to prevent the system
+            // from moving native focus away from the WebView
+            return true;
+        }
+
+        return super.dispatchKeyEvent(event);
+    }
+
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
@@ -190,27 +279,6 @@ public class MainActivity extends Activity {
             if (webView.canGoBack()) {
                 webView.goBack();
                 return true;
-            }
-        }
-        if (customView != null) {
-            switch (keyCode) {
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
-                    webView.evaluateJavascript("window.__tvSeek&&__tvSeek(10)", null);
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                case KeyEvent.KEYCODE_MEDIA_REWIND:
-                    webView.evaluateJavascript("window.__tvSeek&&__tvSeek(-10)", null);
-                    return true;
-                case KeyEvent.KEYCODE_DPAD_CENTER:
-                case KeyEvent.KEYCODE_ENTER:
-                case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
-                case KeyEvent.KEYCODE_MEDIA_PLAY:
-                case KeyEvent.KEYCODE_MEDIA_PAUSE:
-                    webView.evaluateJavascript("window.__tvToggle&&__tvToggle()", null);
-                    return true;
-                default:
-                    break;
             }
         }
         return super.onKeyDown(keyCode, event);

@@ -283,33 +283,56 @@
   window.__tvSeek = function (s) { var v = bigVideo(); if (v) v.currentTime = Math.max(0, v.currentTime + s); };
   window.__tvToggle = function () { var v = bigVideo(); if (v) { v.paused ? v.play() : v.pause(); } };
 
-  window.addEventListener('keydown', function (e) {
-    var k = e.key;
+  // ---------------------------------------------------------------
+  // 6a. Core key handler (shared by both native bridge and keydown)
+  // ---------------------------------------------------------------
+  function handleKey(k, isRepeat) {
     if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') {
       // caret movement while actually typing
-      if (typing && (k === 'ArrowLeft' || k === 'ArrowRight')) return;
+      if (typing && (k === 'ArrowLeft' || k === 'ArrowRight')) return false;
       // fullscreen in-page video: left/right seek
       if (document.fullscreenElement && (k === 'ArrowLeft' || k === 'ArrowRight')) {
-        window.__tvSeek(k === 'ArrowRight' ? 10 : -10); e.preventDefault(); return;
+        window.__tvSeek(k === 'ArrowRight' ? 10 : -10); return true;
       }
       var now = Date.now();
-      if (e.repeat && now - lastMove < 90) { e.preventDefault(); e.stopPropagation(); return; }  // throttle held keys
+      if (isRepeat && now - lastMove < 90) return true;  // throttle held keys
       lastMove = now;
-      if (move(k, e.repeat)) { e.preventDefault(); e.stopPropagation(); }
+      return move(k, isRepeat);
     } else if (k === 'Enter') {
       var el = current && current.isConnected ? current : null;
-      if (!el) return;
+      if (!el) return false;
       if (isTextInput(el)) {
-        if (typing) { typing = false; return; }                       // 2nd Enter = submit (page handles it)
-        e.preventDefault(); e.stopPropagation();
+        if (typing) { typing = false; return false; }     // 2nd Enter = submit (page handles it)
         typing = true;
         try { el.focus(); } catch (x) {}
         try { window.TvBridge && TvBridge.showKeyboard(); } catch (x) {}
-        return;
+        return true;
       }
-      if (el.tagName === 'SELECT') return;
-      e.preventDefault(); e.stopPropagation();
-      if (!e.repeat) el.click();
+      if (el.tagName === 'SELECT') return false;
+      if (!isRepeat) el.click();
+      return true;
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------
+  // 6b. Native bridge: called by MainActivity.dispatchKeyEvent()
+  //     This is the PRIMARY input path on Android TV boxes (like
+  //     Tata Play Binge) where the system eats D-pad keydown events
+  //     before they reach the browser's JavaScript engine.
+  // ---------------------------------------------------------------
+  window.__tvKey = function (key, isRepeat) {
+    handleKey(key, isRepeat);
+  };
+
+  // ---------------------------------------------------------------
+  // 6c. Fallback keydown listener (still fires on some devices /
+  //     when native bridge is not in use, e.g. Chrome on desktop)
+  // ---------------------------------------------------------------
+  window.addEventListener('keydown', function (e) {
+    var k = e.key;
+    if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight' || k === 'Enter') {
+      if (handleKey(k, e.repeat)) { e.preventDefault(); e.stopPropagation(); }
     }
   }, true);
 
