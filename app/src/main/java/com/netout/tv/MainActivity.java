@@ -1,7 +1,9 @@
 package com.netout.tv;
 
 import android.app.Activity;
+import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.os.Bundle;
 import android.view.KeyEvent;
 import android.view.View;
@@ -9,7 +11,9 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.net.Uri;
 import android.os.Message;
+import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -31,6 +35,7 @@ public class MainActivity extends Activity {
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
     private String navScript = "";
+    private boolean injectedThisLoad = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,6 +56,16 @@ public class MainActivity extends Activity {
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
+        s.setTextZoom(100);                           // ignore TV "font size" scaling
+        s.setSupportZoom(false);
+        s.setBuiltInZoomControls(false);
+        s.setDisplayZoomControls(false);
+        // Drop the "Mobile" token so the site serves its desktop/TV layout, not the phone one
+        String ua = s.getUserAgentString();
+        if (ua != null) s.setUserAgentString(ua.replace(" Mobile", "") + " NetoutTV");
+        webView.setInitialScale(0);
+        webView.setBackgroundColor(Color.BLACK);
+        webView.addJavascriptInterface(new TvBridge(), "TvBridge");
         s.setSupportMultipleWindows(true);            // so we can deny popups
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
@@ -66,7 +81,6 @@ public class MainActivity extends Activity {
         webView.setFocusable(true);
         webView.setFocusableInTouchMode(true);
         webView.setScrollBarStyle(View.SCROLLBARS_INSIDE_OVERLAY);
-        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         webView.requestFocus(View.FOCUS_DOWN);
 
         webView.setWebViewClient(new WebViewClient() {
@@ -96,6 +110,12 @@ public class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView v, String url, Bitmap favicon) {
                 super.onPageStarted(v, url, favicon);
+                injectedThisLoad = false;
+            }
+
+            @Override
+            public void onPageCommitVisible(WebView v, String url) {
+                super.onPageCommitVisible(v, url);
                 v.evaluateJavascript(navScript, null);
             }
 
@@ -141,7 +161,10 @@ public class MainActivity extends Activity {
 
             @Override
             public void onProgressChanged(WebView v, int progress) {
-                if (progress > 30) v.evaluateJavascript(navScript, null);
+                if (progress >= 15 && !injectedThisLoad) {
+                    injectedThisLoad = true;
+                    v.evaluateJavascript(navScript, null);
+                }
             }
 
             @Override
@@ -191,6 +214,26 @@ public class MainActivity extends Activity {
             }
         }
         return super.onKeyDown(keyCode, event);
+    }
+
+    /** Lets the page open/close the TV on-screen keyboard (needed for Search). */
+    private class TvBridge {
+        @JavascriptInterface
+        public void showKeyboard() {
+            runOnUiThread(() -> {
+                webView.requestFocus();
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT);
+            });
+        }
+
+        @JavascriptInterface
+        public void hideKeyboard() {
+            runOnUiThread(() -> {
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) imm.hideSoftInputFromWindow(webView.getWindowToken(), 0);
+            });
+        }
     }
 
     private static boolean sameSite(String a, String b) {

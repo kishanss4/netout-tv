@@ -10,15 +10,26 @@ android {
         applicationId "com.netout.tv"
         minSdk 21
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        // CI sets GITHUB_RUN_NUMBER so every release has a higher versionCode
+        versionCode Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "2")
+        versionName "1.1"
+    }
+
+    signingConfigs {
+        // Fixed key kept in the repo so new APKs install OVER old ones
+        // (no more uninstalling first). Sideload-grade only, not for Play Store.
+        netout {
+            storeFile file("netout-release.jks")
+            storePassword "netout123"
+            keyAlias "netout"
+            keyPassword "netout123"
+        }
     }
 
     buildTypes {
-        // Debug-signed so it installs directly with no keystore setup.
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.netout
         }
     }
     compileOptions {

@@ -2,118 +2,271 @@
   if (window.__tvNav) return;
   window.__tvNav = true;
 
-  // ---------- cosmetic ad hiding + focus ring ----------
+  // Layout width the site is rendered at. 1536 CSS px is above every common
+  // "desktop" breakpoint (so no phone/tablet layout, no bottom bar) and is
+  // scaled up to fill the TV. Raise it for smaller UI, lower it for bigger UI.
+  var TV_WIDTH = 1536;
+
+  // ---------------------------------------------------------------
+  // 1. Viewport: force a desktop-sized layout so nothing looks zoomed
+  // ---------------------------------------------------------------
+  var VIEWPORT = 'width=' + TV_WIDTH + ', user-scalable=no';
+  function fixViewport() {
+    try {
+      var head = document.head || document.documentElement;
+      if (!head) return;
+      var m = document.querySelector('meta[name="viewport"]');
+      if (!m) {
+        m = document.createElement('meta');
+        m.name = 'viewport';
+        head.appendChild(m);
+      }
+      if (m.getAttribute('content') !== VIEWPORT) m.setAttribute('content', VIEWPORT);
+    } catch (e) {}
+  }
+  fixViewport();
+  try {
+    new MutationObserver(fixViewport).observe(document.documentElement, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['content', 'name']
+    });
+  } catch (e) {}
+
+  // ---------------------------------------------------------------
+  // 2. CSS: hide ads, drop native focus outlines (we draw our own ring)
+  // ---------------------------------------------------------------
   var css = document.createElement('style');
   css.textContent = [
     'ins.adsbygoogle,[id^="google_ads_iframe"],iframe[src*="doubleclick"],',
     'iframe[src*="googlesyndication"],iframe[src*="adsterra"],iframe[src*="exoclick"],',
     'iframe[src*="propeller"],iframe[src*="popads"],div[id^="div-gpt-ad"],',
     '[class*="adsbygoogle"],[id*="taboola"],[id*="outbrain"]{display:none!important}',
-    '.tv-focus{outline:4px solid #ffcc00!important;outline-offset:3px!important;',
-    'box-shadow:0 0 0 7px rgba(0,0,0,.55)!important;border-radius:6px;',
-    'transition:outline-color .1s}',
-    '*{cursor:none!important}'
+    ':focus{outline:none!important}',
+    '*{-webkit-tap-highlight-color:transparent}',
+    '#__tv_ring{position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;',
+    'box-sizing:border-box;border:4px solid #ffd400;border-radius:10px;display:none;',
+    'box-shadow:0 0 0 2px rgba(0,0,0,.8),0 0 24px 4px rgba(255,212,0,.55);',
+    'transition:transform .09s ease-out;will-change:transform}'
   ].join('');
   (document.head || document.documentElement).appendChild(css);
 
-  // popups are denied natively; this is a second layer
   try { window.open = function () { return null; }; } catch (e) {}
 
-  // ---------- spatial navigation ----------
+  // ---------------------------------------------------------------
+  // 3. Focus ring: a fixed overlay, so it is never clipped by
+  //    overflow:hidden carousels and is always clearly visible
+  // ---------------------------------------------------------------
+  var ring = document.createElement('div');
+  ring.id = '__tv_ring';
+  document.documentElement.appendChild(ring);
+
+  var current = null;
+  var raf = window.requestAnimationFrame || function (f) { return setTimeout(f, 16); };
+
+  function placeRing() {
+    if (!current || !current.isConnected) { ring.style.display = 'none'; return; }
+    var r = current.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) { ring.style.display = 'none'; return; }
+    ring.style.display = 'block';
+    ring.style.width = (r.width + 8) + 'px';
+    ring.style.height = (r.height + 8) + 'px';
+    ring.style.transform = 'translate3d(' + (r.left - 4) + 'px,' + (r.top - 4) + 'px,0)';
+  }
+  function trackRing(ms) {
+    var end = Date.now() + ms;
+    (function f() { placeRing(); if (Date.now() < end) raf(f); })();
+  }
+  var ringQueued = false;
+  function queueRing() {
+    if (ringQueued) return;
+    ringQueued = true;
+    raf(function () { ringQueued = false; placeRing(); });
+  }
+  window.addEventListener('scroll', queueRing, { capture: true, passive: true });
+  window.addEventListener('resize', queueRing, { passive: true });
+
+  // ---------------------------------------------------------------
+  // 4. Candidate tracking (incremental, cached - NOT rescanned per key)
+  // ---------------------------------------------------------------
   var SEL = 'a[href],button,input:not([type=hidden]),select,textarea,summary,' +
             '[tabindex]:not([tabindex="-1"]),[onclick],[role=button],[role=link],' +
             '[role=tab],[role=menuitem],[role=option],[role=checkbox],[role=switch]';
-  var current = null;
+  var PTR_TAGS = { div: 1, span: 1, li: 1, img: 1, svg: 1, p: 1, h1: 1, h2: 1, h3: 1, h4: 1, figure: 1, article: 1, section: 1 };
 
-  function visible(el) {
-    var r = el.getBoundingClientRect();
-    if (r.width < 8 || r.height < 8) return false;
-    if (r.bottom < -2000 || r.top > window.innerHeight + 4000) return false;
-    var cs = getComputedStyle(el);
-    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0' &&
-           cs.pointerEvents !== 'none';
+  var cand = new Set();
+  var ptrCache = new WeakMap();
+  var work = [];          // elements waiting to be classified
+  var pumpTimer = null;
+
+  function classify(el) {
+    if (el.nodeType !== 1 || el.id === '__tv_ring') return;
+    var tag = el.localName;
+    try {
+      if (el.matches(SEL)) { cand.add(el); return; }
+      if (!PTR_TAGS[tag]) return;
+      var v = ptrCache.get(el);
+      if (v === undefined) {
+        v = false;
+        if (getComputedStyle(el).cursor === 'pointer') {
+          var p = el.parentElement;
+          // keep only the OUTERMOST pointer element (children inherit the cursor)
+          v = !(p && getComputedStyle(p).cursor === 'pointer');
+        }
+        ptrCache.set(el, v);
+      }
+      if (v) cand.add(el);
+    } catch (e) {}
   }
 
-  function candidates() {
-    var set = new Set(document.querySelectorAll(SEL));
-    // elements that look clickable (cursor:pointer) but are plain divs/spans
-    var all = document.querySelectorAll('div,span,li,img,svg,p,h1,h2,h3,h4');
-    for (var i = 0; i < all.length && i < 6000; i++) {
-      var el = all[i];
-      var cs = getComputedStyle(el);
-      if (cs.cursor === 'pointer' || el.__tvPtr) {
-        var p = el.parentElement;
-        if (p && p.__tvPtr) continue;       // keep only outermost
-        el.__tvPtr = true;
-        set.add(el);
-      }
+  function enqueue(root) {
+    if (!root || root.nodeType !== 1) return;
+    work.push(root);
+    var all = root.getElementsByTagName('*');
+    for (var i = 0; i < all.length; i++) work.push(all[i]);
+    schedulePump();
+  }
+
+  function pump(limit) {
+    var n = 0;
+    while (work.length && n < limit) { classify(work.pop()); n++; }
+    pumpTimer = null;
+    if (work.length) schedulePump();
+  }
+  function schedulePump() {
+    if (pumpTimer) return;
+    pumpTimer = setTimeout(function () { pump(300); }, 30);
+  }
+
+  enqueue(document.documentElement);
+
+  var pendingAdds = [];
+  var addTimer = null;
+  new MutationObserver(function (recs) {
+    for (var i = 0; i < recs.length; i++) {
+      var a = recs[i].addedNodes;
+      for (var j = 0; j < a.length; j++) if (a[j].nodeType === 1) pendingAdds.push(a[j]);
     }
-    var out = [];
-    set.forEach(function (el) {
-      if (el.disabled) return;
-      if (visible(el)) {
-        // drop container if it holds other candidates of its own
-        out.push(el);
-      }
+    if (current && !current.isConnected) current = null;
+    if (!addTimer && pendingAdds.length) {
+      addTimer = setTimeout(function () {
+        addTimer = null;
+        var list = pendingAdds; pendingAdds = [];
+        for (var k = 0; k < list.length; k++) enqueue(list[k]);
+        queueRing();
+      }, 120);
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // ---------------------------------------------------------------
+  // 5. Spatial navigation
+  // ---------------------------------------------------------------
+  function visibleList() {
+    pump(2500);                               // finish any unscanned DOM first
+    var vw = window.innerWidth, vh = window.innerHeight, out = [];
+    cand.forEach(function (el) {
+      if (!el.isConnected) { cand.delete(el); return; }
+      if (el.disabled || el.id === '__tv_ring') return;
+      var r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return;
+      if (r.bottom < -vh || r.top > vh * 3 || r.right < -vw || r.left > vw * 2) return;
+      out.push({ el: el, r: r });
     });
-    // remove ancestors that contain another candidate (prefer the leaf)
-    return out.filter(function (a) {
-      for (var i = 0; i < out.length; i++) {
-        if (out[i] !== a && a.contains(out[i]) && a.tagName !== 'A' && a.tagName !== 'BUTTON') return false;
-      }
-      return true;
-    });
+    return out;
   }
 
-  function setFocus(el) {
-    if (current) current.classList.remove('tv-focus');
+  function reachable(el, r) {
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return true;
+    var cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') return false;
+    var t = document.elementFromPoint(cx, cy);
+    return !t || el.contains(t) || t.contains(el);   // false if a modal/overlay covers it
+  }
+
+  function inFixedArea(el) {
+    for (var n = el; n && n !== document.documentElement; n = n.parentElement) {
+      var p = getComputedStyle(n).position;
+      if (p === 'fixed' || p === 'sticky') return true;
+    }
+    return false;
+  }
+
+  function reveal(el, fast) {
+    var r = el.getBoundingClientRect(), vh = window.innerHeight, vw = window.innerWidth;
+    var mV = Math.round(vh * 0.16), mH = Math.round(vw * 0.06);
+    var needV = r.top < mV || r.bottom > vh - mV;
+    var needH = r.left < mH || r.right > vw - mH;
+    if (!needV && !needH) return;
+    if (needV && inFixedArea(el)) needV = false;      // don't scroll page for header/nav items
+    if (!needV && !needH) return;
+    var tall = r.height > vh * 0.6;
+    try {
+      el.scrollIntoView({
+        block: needV ? (tall ? 'nearest' : 'center') : 'nearest',
+        inline: needH ? 'center' : 'nearest',
+        behavior: fast ? 'auto' : 'smooth'
+      });
+    } catch (e) {}
+  }
+
+  function setFocus(el, fast) {
+    var wasTyping = typing;
     current = el;
-    el.classList.add('tv-focus');
+    typing = false;
+    if (wasTyping) { try { window.TvBridge && TvBridge.hideKeyboard(); } catch (e) {} }
     try {
       if (!el.matches('a,button,input,select,textarea,summary,[tabindex]')) el.setAttribute('tabindex', '-1');
       el.focus({ preventScroll: true });
     } catch (e) {}
-    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' }); } catch (e) {}
+    reveal(el, fast);
+    placeRing();
+    trackRing(fast ? 120 : 450);
   }
 
   function center(r) { return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }
 
-  function move(dir) {
-    var list = candidates();
+  function move(dir, fast) {
+    var list = visibleList();
     if (!list.length) return false;
-    if (!current || !document.contains(current) || !visible(current)) {
-      // start with the first item currently on screen
-      var first = list.filter(function (e) {
-        var r = e.getBoundingClientRect();
-        return r.top >= 0 && r.top < window.innerHeight && r.left >= 0 && r.left < window.innerWidth;
-      }).sort(function (a, b) {
-        var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-        return (ra.top - rb.top) || (ra.left - rb.left);
-      })[0] || list[0];
-      setFocus(first);
+
+    if (!current || !current.isConnected) {
+      var vh = window.innerHeight, vw = window.innerWidth;
+      var onscreen = list.filter(function (o) {
+        return o.r.top >= 0 && o.r.top < vh && o.r.left >= 0 && o.r.left < vw && reachable(o.el, o.r);
+      }).sort(function (a, b) { return (a.r.top - b.r.top) || (a.r.left - b.r.left); });
+      setFocus((onscreen[0] || list[0]).el, fast);
       return true;
     }
-    var cr = current.getBoundingClientRect(), cc = center(cr), best = null, bestScore = Infinity;
-    list.forEach(function (el) {
-      if (el === current || current.contains(el) || el.contains(current)) return;
-      var r = el.getBoundingClientRect(), c = center(r), dx = c.x - cc.x, dy = c.y - cc.y;
-      var main, cross, ok;
-      if (dir === 'ArrowRight') { ok = r.left >= cr.right - 4 || dx > cr.width / 2; main = dx; cross = Math.abs(dy); }
-      else if (dir === 'ArrowLeft') { ok = r.right <= cr.left + 4 || -dx > cr.width / 2; main = -dx; cross = Math.abs(dy); }
-      else if (dir === 'ArrowDown') { ok = r.top >= cr.bottom - 4 || dy > cr.height / 2; main = dy; cross = Math.abs(dx); }
-      else { ok = r.bottom <= cr.top + 4 || -dy > cr.height / 2; main = -dy; cross = Math.abs(dx); }
-      if (!ok || main <= 0) return;
-      var score = main + cross * 2.5;
-      if (score < bestScore) { bestScore = score; best = el; }
-    });
-    if (best) { setFocus(best); return true; }
-    // nothing further: scroll the page so lazy content can load
-    if (dir === 'ArrowDown') window.scrollBy({ top: Math.round(window.innerHeight * 0.6), behavior: 'smooth' });
-    if (dir === 'ArrowUp') window.scrollBy({ top: -Math.round(window.innerHeight * 0.6), behavior: 'smooth' });
-    return dir === 'ArrowDown' || dir === 'ArrowUp';
+
+    var cr = current.getBoundingClientRect(), cc = center(cr), scored = [];
+    for (var i = 0; i < list.length; i++) {
+      var o = list[i], el = o.el, r = o.r;
+      if (el === current || current.contains(el) || el.contains(current)) continue;
+      var c = center(r), dx = c.x - cc.x, dy = c.y - cc.y, main, cross, ok, overlap;
+      if (dir === 'ArrowRight')      { ok = r.left >= cr.right - 4 || dx > cr.width / 2;  main = dx;  cross = Math.abs(dy); overlap = r.top < cr.bottom && r.bottom > cr.top; }
+      else if (dir === 'ArrowLeft')  { ok = r.right <= cr.left + 4 || -dx > cr.width / 2; main = -dx; cross = Math.abs(dy); overlap = r.top < cr.bottom && r.bottom > cr.top; }
+      else if (dir === 'ArrowDown')  { ok = r.top >= cr.bottom - 4 || dy > cr.height / 2; main = dy;  cross = Math.abs(dx); overlap = r.left < cr.right && r.right > cr.left; }
+      else                           { ok = r.bottom <= cr.top + 4 || -dy > cr.height / 2; main = -dy; cross = Math.abs(dx); overlap = r.left < cr.right && r.right > cr.left; }
+      if (!ok || main <= 0) continue;
+      scored.push({ o: o, s: main + cross * (overlap ? 1.2 : 4) });
+    }
+    scored.sort(function (a, b) { return a.s - b.s; });
+    for (var k = 0; k < scored.length && k < 6; k++) {
+      var cnd = scored[k].o;
+      if (reachable(cnd.el, cnd.r)) { setFocus(cnd.el, fast); return true; }
+    }
+    // nothing further that way: scroll the page so lazy rows load
+    if (dir === 'ArrowDown') { window.scrollBy({ top: Math.round(window.innerHeight * 0.6), behavior: fast ? 'auto' : 'smooth' }); queueRing(); return true; }
+    if (dir === 'ArrowUp')   { window.scrollBy({ top: -Math.round(window.innerHeight * 0.6), behavior: fast ? 'auto' : 'smooth' }); queueRing(); return true; }
+    return true; // swallow Left/Right at the edge so focus can't escape the page
   }
 
-  function isTyping(el) {
+  // ---------------------------------------------------------------
+  // 6. Keys
+  // ---------------------------------------------------------------
+  var typing = false;       // true once Enter has opened the keyboard on an input
+  var lastMove = 0;
+
+  function isTextInput(el) {
     return el && (el.tagName === 'TEXTAREA' ||
       (el.tagName === 'INPUT' && /^(text|search|email|url|password|tel|number)$/i.test(el.type)) ||
       el.isContentEditable);
@@ -127,32 +280,38 @@
     }
     return best || vs[0] || null;
   }
-
-  // used by native code for seeking / play-pause in fullscreen video
   window.__tvSeek = function (s) { var v = bigVideo(); if (v) v.currentTime = Math.max(0, v.currentTime + s); };
   window.__tvToggle = function () { var v = bigVideo(); if (v) { v.paused ? v.play() : v.pause(); } };
 
   window.addEventListener('keydown', function (e) {
     var k = e.key;
     if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') {
-      var t = document.activeElement;
-      if (isTyping(t) && (k === 'ArrowLeft' || k === 'ArrowRight')) return;
-      // video playing fullscreen in-page: left/right seek
+      // caret movement while actually typing
+      if (typing && (k === 'ArrowLeft' || k === 'ArrowRight')) return;
+      // fullscreen in-page video: left/right seek
       if (document.fullscreenElement && (k === 'ArrowLeft' || k === 'ArrowRight')) {
         window.__tvSeek(k === 'ArrowRight' ? 10 : -10); e.preventDefault(); return;
       }
-      if (move(k)) { e.preventDefault(); e.stopPropagation(); }
+      var now = Date.now();
+      if (e.repeat && now - lastMove < 90) { e.preventDefault(); e.stopPropagation(); return; }  // throttle held keys
+      lastMove = now;
+      if (move(k, e.repeat)) { e.preventDefault(); e.stopPropagation(); }
     } else if (k === 'Enter') {
-      var el = current && document.contains(current) ? current : null;
-      if (el && !isTyping(el) && el.tagName !== 'SELECT') {
+      var el = current && current.isConnected ? current : null;
+      if (!el) return;
+      if (isTextInput(el)) {
+        if (typing) { typing = false; return; }                       // 2nd Enter = submit (page handles it)
         e.preventDefault(); e.stopPropagation();
-        el.click();
+        typing = true;
+        try { el.focus(); } catch (x) {}
+        try { window.TvBridge && TvBridge.showKeyboard(); } catch (x) {}
+        return;
       }
+      if (el.tagName === 'SELECT') return;
+      e.preventDefault(); e.stopPropagation();
+      if (!e.repeat) el.click();
     }
   }, true);
 
-  // when the page changes (SPA), forget stale focus
-  new MutationObserver(function () {
-    if (current && !document.contains(current)) current = null;
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  setInterval(function () { if (current) placeRing(); }, 400);
 })();

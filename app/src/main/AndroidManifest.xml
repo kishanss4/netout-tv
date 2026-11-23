@@ -13,6 +13,7 @@
         android:icon="@drawable/tv_banner"
         android:label="Netout"
         android:hardwareAccelerated="true"
+        android:largeHeap="true"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
         <activity
