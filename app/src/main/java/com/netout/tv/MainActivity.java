@@ -196,7 +196,7 @@ public class MainActivity extends Activity {
 
             @Override
             public boolean onConsoleMessage(android.webkit.ConsoleMessage msg) {
-                addLog("Console [" + msg.messageLevel() + "]: " + msg.message() + " (" + msg.sourceId() + ":" + msg.lineNumber() + ")");
+                addLog("Console: " + msg.message());
                 return super.onConsoleMessage(msg);
             }
         });
@@ -207,7 +207,7 @@ public class MainActivity extends Activity {
             webView.loadUrl(START_URL);
         }
 
-        // Start Local Web Debugger on Port 8080
+        // Start Local Web Debugger & Companion on Port 8080
         startDebugServer();
     }
 
@@ -219,10 +219,10 @@ public class MainActivity extends Activity {
 
     private void addLog(String message) {
         Log.d(TAG, message);
-        while (logHistory.size() > 80) {
+        while (logHistory.size() > 100) {
             logHistory.remove(0);
         }
-        logHistory.add(System.currentTimeMillis() + " " + message);
+        logHistory.add(message);
     }
 
     @Override
@@ -234,7 +234,6 @@ public class MainActivity extends Activity {
             return super.dispatchKeyEvent(event);
         }
 
-        // Handle fullscreen video
         if (customView != null) {
             if (action == KeyEvent.ACTION_DOWN) {
                 switch (keyCode) {
@@ -259,7 +258,6 @@ public class MainActivity extends Activity {
             return super.dispatchKeyEvent(event);
         }
 
-        // D-Pad remote navigation
         boolean isDpad = false;
         String jsKey = null;
         switch (keyCode) {
@@ -276,7 +274,7 @@ public class MainActivity extends Activity {
         if (isDpad) {
             if (action == KeyEvent.ACTION_DOWN) {
                 boolean isRepeat = event.getRepeatCount() > 0;
-                addLog("Key: " + jsKey + " repeat=" + isRepeat);
+                addLog("Key: " + jsKey);
                 String js = "window.__tvKey&&__tvKey('" + jsKey + "'," + isRepeat + ")";
                 webView.evaluateJavascript(js, null);
             }
@@ -382,15 +380,15 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------------
-    // Embedded Local Web Debugger on port 8080 (Accessible via http://tv-ip:8080)
+    // Embedded Web Server: Remote Control, Play on TV, and Sync API
     // ------------------------------------------------------------------------
     private void startDebugServer() {
         try {
             debugServer = new DebugServer(DEBUG_PORT);
             debugServer.start();
-            addLog("Debug server started on port " + DEBUG_PORT);
+            addLog("Server running on port " + DEBUG_PORT);
         } catch (Exception e) {
-            addLog("Debug server failed: " + e.getMessage());
+            addLog("Server error: " + e.getMessage());
         }
     }
 
@@ -404,7 +402,7 @@ public class MainActivity extends Activity {
         }
 
         public void start() {
-            new Thread(this, "NetoutDebugServer").start();
+            new Thread(this, "NetoutServer").start();
         }
 
         public void stop() {
@@ -429,7 +427,7 @@ public class MainActivity extends Activity {
 
         private void handleClient(Socket socket) {
             new Thread(() -> {
-                try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
                      OutputStream out = socket.getOutputStream();
                      PrintWriter pw = new PrintWriter(out)) {
 
@@ -439,10 +437,48 @@ public class MainActivity extends Activity {
                     String[] parts = line.split(" ");
                     if (parts.length < 2) return;
                     String method = parts[0];
-                    String path = parts[1];
+                    String rawPath = parts[1];
 
-                    if (path.startsWith("/key?k=")) {
-                        String key = path.substring(7);
+                    // Allow CORS from any origin so mobile browser bookmarklets can communicate directly
+                    if (method.equalsIgnoreCase("OPTIONS")) {
+                        sendCorsPreflight(pw);
+                        return;
+                    }
+
+                    if (rawPath.startsWith("/play?url=")) {
+                        String encodedUrl = rawPath.substring(10);
+                        String url = URLDecoder.decode(encodedUrl, "UTF-8");
+                        addLog("Casting URL: " + url);
+                        mainHandler.post(() -> webView.loadUrl(url));
+                        sendResponse(pw, "200 OK", "application/json", "{\"status\":\"playing\",\"url\":\"" + url + "\"}");
+
+                    } else if (rawPath.startsWith("/sync?")) {
+                        // Dynamic sync commands from phone
+                        String query = rawPath.substring(6);
+                        String action = getQueryParam(query, "action");
+
+                        if ("openModal".equals(action)) {
+                            String id = getQueryParam(query, "id");
+                            String type = getQueryParam(query, "type");
+                            addLog("Sync modal: " + id + " (" + type + ")");
+                            mainHandler.post(() -> webView.evaluateJavascript("window.openModal&&openModal('" + id + "', '" + type + "')", null));
+                        } else if ("play".equals(action)) {
+                            addLog("Sync play click");
+                            mainHandler.post(() -> webView.evaluateJavascript(
+                                    "var p = document.getElementById('modal-play') || document.querySelector('.play-button'); if(p) p.click();", null));
+                        } else if ("seek".equals(action)) {
+                            String sec = getQueryParam(query, "sec");
+                            mainHandler.post(() -> webView.evaluateJavascript("window.__tvSeek&&__tvSeek(" + sec + ")", null));
+                        } else if ("toggle".equals(action)) {
+                            mainHandler.post(() -> webView.evaluateJavascript("window.__tvToggle&&__tvToggle()", null));
+                        } else if ("close".equals(action)) {
+                            mainHandler.post(() -> webView.evaluateJavascript("window.closePlayer&&closePlayer(); history.back();", null));
+                        }
+
+                        sendResponse(pw, "200 OK", "application/json", "{\"status\":\"ok\"}");
+
+                    } else if (rawPath.startsWith("/key?k=")) {
+                        String key = rawPath.substring(7);
                         mainHandler.post(() -> {
                             if (key.equals("Back")) {
                                 if (webView.canGoBack()) webView.goBack();
@@ -451,75 +487,172 @@ public class MainActivity extends Activity {
                             }
                         });
                         sendResponse(pw, "200 OK", "text/plain", "OK: " + key);
-                    } else if (path.startsWith("/eval?js=")) {
-                        String encodedJs = path.substring(9);
+
+                    } else if (rawPath.startsWith("/eval?js=")) {
+                        String encodedJs = rawPath.substring(9);
                         String js = URLDecoder.decode(encodedJs, "UTF-8");
-                        mainHandler.post(() -> webView.evaluateJavascript(js, res -> addLog("Eval result: " + res)));
+                        mainHandler.post(() -> webView.evaluateJavascript(js, res -> addLog("Eval: " + res)));
                         sendResponse(pw, "200 OK", "text/plain", "Evaluated");
-                    } else if (path.startsWith("/logs")) {
+
+                    } else if (rawPath.startsWith("/logs")) {
                         StringBuilder sb = new StringBuilder();
                         synchronized (logHistory) {
                             for (String l : logHistory) sb.append(l).append("\n");
                         }
                         sendResponse(pw, "200 OK", "text/plain", sb.toString());
-                    } else if (path.equals("/reload")) {
+
+                    } else if (rawPath.equals("/reload")) {
                         mainHandler.post(() -> webView.reload());
                         sendResponse(pw, "200 OK", "text/plain", "Reloaded");
+
                     } else {
-                        // Serve Web Remote HTML
-                        String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
-                                "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
-                                "<title>Netout TV Remote & Debugger</title>" +
-                                "<style>" +
-                                "body{background:#111;color:#eee;font-family:sans-serif;margin:0;padding:20px;text-align:center;}" +
-                                "h2{color:#ffd400;margin-bottom:15px;}" +
-                                ".dpad{display:inline-grid;grid-template-columns:80px 80px 80px;grid-gap:10px;margin:20px auto;}" +
-                                "button{background:#2a2a2a;color:#fff;border:2px solid #555;padding:15px;font-size:18px;border-radius:10px;cursor:pointer;touch-action:manipulation;}" +
-                                "button:active{background:#ffd400;color:#000;}" +
-                                ".btn-ok{background:#d32f2f;font-weight:bold;}" +
-                                ".actions{margin:15px 0;}" +
-                                ".actions button{padding:10px 18px;font-size:15px;margin:5px;}" +
-                                "#logs{background:#000;color:#00ff66;font-family:monospace;height:240px;overflow-y:auto;padding:10px;text-align:left;border-radius:8px;font-size:13px;border:1px solid #333;margin-top:20px;white-space:pre-wrap;}" +
-                                "</style></head><body>" +
-                                "<h2>📺 Netout TV Remote & Debugger</h2>" +
-                                "<div class='dpad'>" +
-                                "<div></div><button onclick=\"sendKey('ArrowUp')\">▲ UP</button><div></div>" +
-                                "<button onclick=\"sendKey('ArrowLeft')\">◀ LEFT</button>" +
-                                "<button class='btn-ok' onclick=\"sendKey('Enter')\">OK</button>" +
-                                "<button onclick=\"sendKey('ArrowRight')\">RIGHT ▶</button>" +
-                                "<div></div><button onclick=\"sendKey('ArrowDown')\">▼ DOWN</button><div></div>" +
-                                "</div>" +
-                                "<div class='actions'>" +
-                                "<button onclick=\"sendKey('Back')\">↩ BACK</button>" +
-                                "<button onclick=\"fetch('/reload')\">🔄 RELOAD</button>" +
-                                "<button onclick=\"evalJs('window.__tvGetInfo&&console.log(JSON.stringify(window.__tvGetInfo()))')\">ℹ️ INFO</button>" +
-                                "</div>" +
-                                "<div style='margin-top:10px;'>" +
-                                "<input id='jsIn' placeholder='document.querySelector(...) style...' style='width:60%;padding:10px;background:#222;color:#fff;border:1px solid #444;border-radius:6px;'>" +
-                                "<button onclick=\"evalCustom()\" style='padding:10px 15px;margin-left:5px;'>Run JS</button>" +
-                                "</div>" +
-                                "<div id='logs'>Connecting to logs...</div>" +
-                                "<script>" +
-                                "function sendKey(k){ fetch('/key?k='+k); }" +
-                                "function evalCustom(){ var v=document.getElementById('jsIn').value; if(v) fetch('/eval?js='+encodeURIComponent(v)); }" +
-                                "function pollLogs(){ fetch('/logs').then(r=>r.text()).then(t=>{ var el=document.getElementById('logs'); el.innerText=t; el.scrollTop=el.scrollHeight; }).catch(()=>{}); }" +
-                                "setInterval(pollLogs, 1000);" +
-                                "pollLogs();" +
-                                "</script></body></html>";
+                        // Serve Companion & Remote HTML UI
+                        String hostHeader = socket.getLocalAddress().getHostAddress() + ":" + port;
+                        String html = getCompanionHtml(hostHeader);
                         sendResponse(pw, "200 OK", "text/html; charset=utf-8", html);
                     }
                 } catch (Exception ignored) {}
             }).start();
         }
 
+        private String getQueryParam(String query, String name) {
+            for (String pair : query.split("&")) {
+                int eq = pair.indexOf('=');
+                if (eq > 0 && pair.substring(0, eq).equals(name)) {
+                    try {
+                        return URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
+                    } catch (Exception e) {
+                        return pair.substring(eq + 1);
+                    }
+                }
+            }
+            return "";
+        }
+
+        private void sendCorsPreflight(PrintWriter pw) {
+            pw.print("HTTP/1.1 204 No Content\r\n");
+            pw.print("Access-Control-Allow-Origin: *\r\n");
+            pw.print("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+            pw.print("Access-Control-Allow-Headers: *\r\n");
+            pw.print("Connection: close\r\n\r\n");
+            pw.flush();
+        }
+
         private void sendResponse(PrintWriter pw, String status, String contentType, String body) {
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             pw.print("HTTP/1.1 " + status + "\r\n");
+            pw.print("Access-Control-Allow-Origin: *\r\n");
             pw.print("Content-Type: " + contentType + "\r\n");
             pw.print("Content-Length: " + bytes.length + "\r\n");
             pw.print("Connection: close\r\n\r\n");
             pw.print(body);
             pw.flush();
+        }
+
+        private String getCompanionHtml(String host) {
+            // Bookmarklet code that hooks into netout.pages.dev
+            String bml = "javascript:(function(){" +
+                    "if(window.__netoutCastActive){alert('Cast to TV is already active!');return;}" +
+                    "window.__netoutCastActive=true;" +
+                    "var TV_HOST='http://" + host + "';" +
+                    "function send(action,params){" +
+                    "  var q='?action='+action;" +
+                    "  for(var k in params) q+='&'+k+'='+encodeURIComponent(params[k]);" +
+                    "  fetch(TV_HOST+'/sync'+q,{mode:'no-cors'}).catch(function(){});" +
+                    "}" +
+                    "var bar=document.createElement('div');" +
+                    "bar.style='position:fixed;bottom:15px;left:50%;transform:translateX(-50%);background:#181818;color:#ffd400;padding:12px 20px;border-radius:30px;box-shadow:0 6px 20px rgba(0,0,0,0.8);z-index:999999;display:flex;align-items:center;gap:12px;font-family:sans-serif;font-weight:bold;font-size:14px;border:2px solid #ffd400;';" +
+                    "bar.innerHTML='<span>📺 CAST TO TV ACTIVE</span>'+" +
+                    "'<button id=\"_castPlay\" style=\"background:#ffd400;color:#000;border:none;padding:6px 12px;border-radius:15px;font-weight:bold;cursor:pointer;\">PLAY/PAUSE</button>'+" +
+                    "'<button id=\"_castSeekBack\" style=\"background:#333;color:#fff;border:none;padding:6px 10px;border-radius:15px;cursor:pointer;\">-10s</button>'+" +
+                    "'<button id=\"_castSeekFwd\" style=\"background:#333;color:#fff;border:none;padding:6px 10px;border-radius:15px;cursor:pointer;\">+10s</button>'+" +
+                    "'<button id=\"_castClose\" style=\"background:#d32f2f;color:#fff;border:none;padding:6px 10px;border-radius:15px;cursor:pointer;\">✕</button>';" +
+                    "document.body.appendChild(bar);" +
+                    "document.getElementById('_castPlay').onclick=function(){send('toggle',{});};" +
+                    "document.getElementById('_castSeekBack').onclick=function(){send('seek',{sec:'-10'});};" +
+                    "document.getElementById('_castSeekFwd').onclick=function(){send('seek',{sec:'10'});};" +
+                    "document.getElementById('_castClose').onclick=function(){bar.remove();window.__netoutCastActive=false;};" +
+                    "var origOpen = window.openModal;" +
+                    "if(origOpen){window.openModal=function(id,type){send('openModal',{id:id,type:type});return origOpen.apply(this,arguments);};}" +
+                    "document.addEventListener('click',function(e){" +
+                    "  var p=e.target.closest('#modal-play, .play-button, .play-button2, .episode-item, .next-button');" +
+                    "  if(p){ send('play',{}); send('url',{url:location.href}); }" +
+                    "},true);" +
+                    "alert('🟢 Connected to TV! Every movie or episode you click will now sync and play on your TV.');" +
+                    "})();";
+
+            return "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
+                    "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+                    "<title>Netout TV Cast & Remote</title>" +
+                    "<style>" +
+                    "body{background:#0e0e0e;color:#eee;font-family:system-ui,-apple-system,sans-serif;margin:0;padding:20px;text-align:center;}" +
+                    "h2{color:#ffd400;margin:10px 0 5px;font-size:24px;}" +
+                    ".tagline{color:#aaa;font-size:14px;margin-bottom:20px;}" +
+                    ".card{background:#181818;border:1px solid #2a2a2a;border-radius:14px;padding:20px;margin-bottom:20px;text-align:left;box-shadow:0 4px 15px rgba(0,0,0,0.5);}" +
+                    ".card h3{color:#ffd400;margin-top:0;font-size:18px;display:flex;align-items:center;gap:8px;}" +
+                    ".bml-btn{display:block;background:linear-gradient(135deg,#ffd400,#ff9900);color:#000;font-weight:bold;text-decoration:none;padding:15px;text-align:center;border-radius:10px;font-size:16px;margin:15px 0;box-shadow:0 4px 12px rgba(255,212,0,0.4);}" +
+                    "input{width:100%;box-sizing:border-box;padding:12px;background:#242424;color:#fff;border:1px solid #444;border-radius:8px;font-size:15px;margin-bottom:10px;}" +
+                    "button.btn-primary{background:#d32f2f;color:#fff;border:none;padding:12px 20px;border-radius:8px;font-weight:bold;font-size:15px;cursor:pointer;width:100%;}" +
+                    ".dpad{display:inline-grid;grid-template-columns:75px 75px 75px;grid-gap:10px;margin:15px auto;}" +
+                    ".dpad button{background:#252525;color:#fff;border:1px solid #444;padding:16px 0;font-size:17px;border-radius:10px;cursor:pointer;touch-action:manipulation;}" +
+                    ".dpad button:active{background:#ffd400;color:#000;}" +
+                    ".btn-ok{background:#d32f2f!important;font-weight:bold;}" +
+                    ".media-btns{display:flex;justify-content:center;gap:10px;margin-top:10px;}" +
+                    ".media-btns button{background:#222;border:1px solid #444;color:#fff;padding:10px 14px;border-radius:8px;cursor:pointer;font-size:14px;}" +
+                    "#logs{background:#000;color:#00ff66;font-family:monospace;height:180px;overflow-y:auto;padding:10px;text-align:left;border-radius:8px;font-size:12px;border:1px solid #222;white-space:pre-wrap;}" +
+                    "</style></head><body>" +
+                    "<h2>📺 Netout TV Companion</h2>" +
+                    "<div class='tagline'>Connected to Tata Play Binge (" + host + ")</div>" +
+
+                    "<div class='card'>" +
+                    "<h3>📲 Step 1: Open Netout on Your Phone</h3>" +
+                    "<p style='color:#ccc;font-size:14px;line-height:1.5;'>Open Netout in a new tab on your phone to browse, search, and pick movies with touch:</p>" +
+                    "<a href='https://netout.pages.dev/home' target='_blank' class='bml-btn' style='background:#2a2a2a;color:#ffd400;border:1px solid #ffd400;'>🌐 Open netout.pages.dev in New Tab</a>" +
+                    "</div>" +
+
+                    "<div class='card'>" +
+                    "<h3>🪄 Step 2: One-Tap 'Cast to TV' Bookmark</h3>" +
+                    "<p style='color:#ccc;font-size:14px;line-height:1.5;'>Copy this code or bookmark it on your phone. When on <b>netout.pages.dev</b>, tap it once to activate Live TV Sync!</p>" +
+                    "<textarea id='bmlCode' readonly style='width:100%;height:65px;background:#111;color:#aaa;border:1px solid #333;border-radius:6px;font-size:11px;padding:8px;box-sizing:border-box;'>" + bml + "</textarea>" +
+                    "<button onclick=\"copyBml()\" class='btn-primary' style='background:#ffd400;color:#000;margin-top:10px;'>📋 Copy Bookmarklet Code</button>" +
+                    "</div>" +
+
+                    "<div class='card'>" +
+                    "<h3>🔗 Quick Cast URL directly</h3>" +
+                    "<input id='castUrl' placeholder='Paste movie/series link (e.g. netout.pages.dev/home?movie=...)' />" +
+                    "<button class='btn-primary' onclick=\"castUrl()\">▶ Play Directly on TV</button>" +
+                    "</div>" +
+
+                    "<div class='card' style='text-align:center;'>" +
+                    "<h3>🎮 TV Remote & Playback</h3>" +
+                    "<div class='dpad'>" +
+                    "<div></div><button onclick=\"sendKey('ArrowUp')\">▲</button><div></div>" +
+                    "<button onclick=\"sendKey('ArrowLeft')\">◀</button>" +
+                    "<button class='btn-ok' onclick=\"sendKey('Enter')\">OK</button>" +
+                    "<button onclick=\"sendKey('ArrowRight')\">▶</button>" +
+                    "<div></div><button onclick=\"sendKey('ArrowDown')\">▼</button><div></div>" +
+                    "</div>" +
+                    "<div class='media-btns'>" +
+                    "<button onclick=\"sendSync('seek&sec=-10')\">⏪ -10s</button>" +
+                    "<button onclick=\"sendSync('toggle')\" style='background:#d32f2f;'>⏯ Play/Pause</button>" +
+                    "<button onclick=\"sendSync('seek&sec=10')\">+10s ⏩</button>" +
+                    "<button onclick=\"sendKey('Back')\">↩ Back</button>" +
+                    "</div>" +
+                    "</div>" +
+
+                    "<div class='card'>" +
+                    "<h3>📋 Live Activity Logs</h3>" +
+                    "<div id='logs'>Loading...</div>" +
+                    "</div>" +
+
+                    "<script>" +
+                    "function copyBml(){ var t=document.getElementById('bmlCode'); t.select(); document.execCommand('copy'); alert('Copied! Add a bookmark on your phone and paste this in the URL field.'); }" +
+                    "function castUrl(){ var u=document.getElementById('castUrl').value; if(u){ fetch('/play?url='+encodeURIComponent(u)); alert('Sent to TV!'); } }" +
+                    "function sendKey(k){ fetch('/key?k='+k); }" +
+                    "function sendSync(p){ fetch('/sync?action='+p); }" +
+                    "function pollLogs(){ fetch('/logs').then(r=>r.text()).then(t=>{ var el=document.getElementById('logs'); el.innerText=t; el.scrollTop=el.scrollHeight; }).catch(()=>{}); }" +
+                    "setInterval(pollLogs, 1200); pollLogs();" +
+                    "</script></body></html>";
         }
     }
 }
